@@ -3,7 +3,7 @@
  * Plugin Name:       SVG Gravity
  * Plugin URI:        https://www.sferainteractive.com/
  * Description:       Enhancements for Gravity Forms including secure edit links and customized webhook payloads.
- * Version:           3.2.6
+ * Version:           3.3.1
  * Author:            Sfera Interactive
  * Author URI:        https://www.sferainteractive.com/
  * License:           GPL v2 or later
@@ -14,6 +14,28 @@
 if ( ! defined( 'WPINC' ) ) die;
 
 /**
+ * V3.3.1: Refined webhook payload to exactly match the semantic model.
+ * - Field keys now use double underscores (e.g., 'company__name').
+ * - Nested form arrays are now correctly placed inside the 'submission_data' object.
+ * 
+ * V3.3.0: Reworked webhook payload for clean structure and full data population.
+ * - Fixes empty 'Name' fields by correctly assembling full names.
+ * - Restructures JSON: groups main data under 'submission_data' and separates nested forms.
+ * - Ensures all fields, including those in nested forms, are populated.
+ * 
+ * V3.2.9: Final fix to prevent all conflicts with standard forms.
+ * - Checks for unique edit URL parameters first, which is the safest method.
+ * - Guarantees plugin logic never runs on or interferes with standard forms.
+ * 
+ * V3.2.8: Isolated plugin logic to prevent conflicts with standard forms.
+ * - Plugin now only runs on the designated 'form-test-edit' page.
+ * - Fixes "Next" and "Save & Continue" buttons being disabled on other forms.
+ * - Resolves all remaining JavaScript conflicts.
+ * 
+ * V3.2.7: Fixed JavaScript errors on standard forms.
+ * - Manually enqueues GF scripts on edit page to prevent "gform is not defined" error.
+ * - Resolves conflicts with standard Gravity Forms functionality.
+ * 
  * V3.2.6: Fixed sluggified field names in debug banner.
  * - Uses a more reliable map-based approach for field name lookup
  * - Ensures all fields (simple, complex, and nested) are correctly labeled
@@ -72,22 +94,42 @@ add_filter( 'gform_entry_post_save', 'svg_generate_edit_token', 5, 2 );
  */
 add_action( 'template_redirect', 'svg_setup_entry_editing' );
 function svg_setup_entry_editing() {
-    if ( isset( $_GET['gform_update'] ) && isset( $_GET['token'] ) ) {
-        $entry_id = intval( $_GET['gform_update'] );
-        $token    = sanitize_text_field( $_GET['token'] );
+    // Check for the unique edit URL parameters first. This is the safest way to ensure
+    // the plugin only runs when it's supposed to and never interferes with other forms.
+    if ( ! isset( $_GET['gform_update'] ) || ! isset( $_GET['token'] ) ) {
+        return;
+    }
+    
+    // Only affect the frontend, and only on the designated edit page.
+    if ( is_admin() || ! is_page( 'form-test-edit' ) ) {
+        return;
+    }
+    
+    $entry_id = intval( $_GET['gform_update'] );
+    $token    = sanitize_text_field( $_GET['token'] );
 
-        if ( svg_verify_edit_token( $entry_id, $token ) ) {
-            // Use Gravity Forms' built-in entry editing
-            add_filter( 'gform_entries_field_value', 'svg_populate_entry_field_value', 10, 4 );
-            
-            // Simple content replacement
-            add_filter( 'the_content', 'svg_replace_with_entry_editor', 999 );
-            
-            // Edit banner
-            add_action( 'wp_footer', 'svg_add_banner' );
-            
-            error_log( 'SVG Gravity (v3.2.0): Using built-in entry editing for entry ' . $entry_id );
+    if ( svg_verify_edit_token( $entry_id, $token ) ) {
+        
+        // Force Gravity Forms scripts and styles to load.
+        // This is the critical fix for the "gform is not defined" error.
+        $entry = GFAPI::get_entry( $entry_id );
+        if ( ! is_wp_error( $entry ) ) {
+            $form_id = $entry['form_id'];
+            if ( function_exists( 'gravity_form_enqueue_scripts' ) ) {
+                gravity_form_enqueue_scripts( $form_id, true );
+            }
         }
+        
+        // Use Gravity Forms' built-in entry editing
+        add_filter( 'gform_entries_field_value', 'svg_populate_entry_field_value', 10, 4 );
+        
+        // Simple content replacement
+        add_filter( 'the_content', 'svg_replace_with_entry_editor', 999 );
+        
+        // Edit banner
+        add_action( 'wp_footer', 'svg_add_banner' );
+        
+        error_log( 'SVG Gravity (v3.2.0): Using built-in entry editing for entry ' . $entry_id );
     }
 }
 
@@ -317,34 +359,93 @@ function svg_add_edit_token_to_webhook( $request_data, $feed, $entry, $form ) {
 }
 
 /**
- * Customize webhook payload
+ * Helper function to create double-underscore slugs from field labels.
  */
-add_filter( 'gform_webhooks_request_data', 'svg_customize_webhook_payload', 10, 4 );
-function svg_customize_webhook_payload( $request_data, $feed, $entry, $form ) {
-    $request_data['form_info'] = array(
-        'form_id' => $form['id'],
-        'form_title' => $form['title'],
-        'form_description' => $form['description']
-    );
+function svg_slugify_label( $label ) {
+    // Return an empty string if the label is empty to avoid creating stray keys.
+    if ( empty( $label ) ) {
+        return '';
+    }
+    // Replaces spaces and hyphens with double underscores for a clean, semantic key.
+    return str_replace( '-', '__', sanitize_title( $label ) );
+}
+
+/**
+ * Customize webhook payload to match the desired semantic structure.
+ */
+add_filter( 'gform_webhooks_request_data', 'svg_rebuild_webhook_payload', 15, 4 );
+function svg_rebuild_webhook_payload( $request_data, $feed, $entry, $form ) {
     
-    $request_data['submission_time'] = array(
-        'timestamp' => $entry['date_created'],
-        'formatted' => date( 'Y-m-d H:i:s', strtotime( $entry['date_created'] ) )
-    );
-    
-    if ( $entry['created_by'] ) {
-        $user = get_userdata( $entry['created_by'] );
-        if ( $user ) {
-            $request_data['user_info'] = array(
-                'user_id' => $entry['created_by'],
-                'user_email' => $user->user_email,
-                'user_name' => $user->display_name
-            );
+    $submission_data = [];
+
+    // Process all fields from the main form
+    foreach ( $form['fields'] as $field ) {
+        $field_label_slug = svg_slugify_label( $field->label );
+        // Skip fields that don't produce a valid slug (e.g., layout fields with no label)
+        if ( empty( $field_label_slug ) ) continue;
+        
+        // Handle Nested Forms
+        if ( $field->type == 'form' ) {
+            $submission_data[$field_label_slug] = [];
+            $nested_entry_ids = explode( ',', rgar( $entry, (string) $field->id ) );
+
+            foreach ( $nested_entry_ids as $nested_entry_id ) {
+                $nested_entry = GFAPI::get_entry( trim($nested_entry_id) );
+                if ( is_wp_error( $nested_entry ) || ! $nested_entry ) continue;
+                
+                $nested_form = GFAPI::get_form( $nested_entry['form_id'] );
+                $nested_item_data = [];
+
+                foreach ( $nested_form['fields'] as $nested_field ) {
+                    $nested_field_label_slug = svg_slugify_label( $nested_field->label );
+                    if ( empty( $nested_field_label_slug ) ) continue;
+                    
+                    if ( $nested_field->type == 'name' ) {
+                        $full_name = [];
+                        foreach ( $nested_field->inputs as $input ) {
+                            $input_value = rgar( $nested_entry, (string) $input['id'] );
+                            if ( ! empty( $input_value ) ) {
+                                $full_name[] = $input_value;
+                            }
+                        }
+                        $nested_item_data[$nested_field_label_slug] = implode( ' ', $full_name );
+                    } else {
+                        $nested_item_data[$nested_field_label_slug] = rgar( $nested_entry, (string) $nested_field->id );
+                    }
+                }
+                $submission_data[$field_label_slug][] = $nested_item_data;
+            }
+        // Handle Main Form Name Fields
+        } else if ( $field->type == 'name' ) {
+            $full_name = [];
+            foreach ( $field->inputs as $input ) {
+                $input_value = rgar( $entry, (string) $input['id'] );
+                if ( ! empty( $input_value ) ) {
+                    $full_name[] = $input_value;
+                }
+            }
+            $submission_data[$field_label_slug] = implode( ' ', $full_name );
+        // Handle all other main form fields
+        } else {
+            $submission_data[$field_label_slug] = rgar( $entry, (string) $field->id );
         }
     }
+
+    // Build the final payload structure according to the model
+    $payload = [];
+    if ( isset( $request_data['edit_token'] ) ) {
+        $payload['edit_token'] = $request_data['edit_token'];
+        $payload['edit_url'] = $request_data['edit_url'];
+        $payload['entry_id'] = $request_data['entry_id'];
+    }
     
-    return $request_data;
+    $payload['submission_data'] = $submission_data;
+
+    return $payload;
 }
+
+// Remove the old, simplistic customization function
+remove_filter( 'gform_webhooks_request_data', 'svg_customize_webhook_payload', 10, 4 );
 
 // --------------------------------------------------------------------------------
 // 4. Notification Email Enhancement
